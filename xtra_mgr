@@ -1,0 +1,222 @@
+#!/usr/bin/perl
+
+use DBI;
+use Getopt::Long qw(GetOptions);
+
+($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+
+@months = qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
+$year = $year + 1900;
+$month = $months[$mon];
+
+$today = "${year}${month}$mday";
+$now = "${today}_${hour}${min}${sec}";
+
+print "today:$today\n";
+
+# get the password
+my $root_pwd = `zgrep ROOT /MYSIDS/mysql/dbpwdz | cut -d= -f2`;
+chomp($root_pwd);
+
+my $dsn="DBI:mysql:mysql";
+
+my $username="root";
+
+my %attr = ( PrintError=>0,
+RaiseError=>1);
+
+#make sure we can connect
+my $dbh = DBI->connect($dsn, $username, $root_pwd, \%attr) || die "connect to localhost failed";
+
+print "Connected to the MySQL Database\n";
+
+# process command line arguments
+# -f full backup
+# -p <value> # of parallal processes
+# -s is this a slave
+# -i cumulative incremental backup
+# -d differential incremental backup
+
+my $full;
+my $incremental,
+my $differential,
+
+my $inc_opt = " ";
+my $slave_opt = " ";
+my $parallel=4;
+my $bkup_home="/backup/percona";
+my $bkup_root="$bkup_home/xtrabkup_$today";
+
+my $bkup_opt = " --no-timestamp ";
+
+GetOptions('full!' => \$full,
+           'incremental!', \$incremental,
+           'differential!', \$differential,
+           'parallel=i' => \$parallel,
+           'bkup_root=s' => \$bkup_root,
+           'slave!', \$slave,
+           'apply=s', \$use_mem,
+           'apply-all=s', \$apply_mem);
+
+if(defined $full){
+  print "full backup\n";
+}
+elsif(defined $incremental){
+  print "cumulative backup\n";
+  $inc_opt = 1;
+}
+elsif(defined $differential){
+  print "differential backup\n";
+  $inc_opt = 2;
+}
+else{
+  print "Usage: must use one of full|incremental|differential\n";
+  exit 1;
+}
+
+if($full + $incremental + $differential > 1){
+  print "Usage: only one of full|incremental|differential can be given\n";
+  exit 2;
+}
+
+if(defined $parallel){
+  print "parallel: $parallel\n";
+  $parallel_opt = " --parallel=$parallel ";
+}
+
+if(defined $slave){
+  print "slave backup\n";
+  $slave_opt = " --slave-info --safe-slave-backup";
+}
+
+if(defined $use_mem){
+  print "apply incremental\n";
+  $apply_opt = " --apply-log --redo-only --use-mem=$use_mem ";
+}
+
+if(defined $apply_mem){
+  print "apply all incremental\n";
+  $apply_opt = " --apply-log --use-mem=$apply_mem ";
+}
+
+print "bkup_root: $bkup_root ";
+if(-d $bkup_root){
+  print "exists\n";
+}
+else{
+  print "does NOT exist\n";
+}
+
+# if we're doing a full backup see if the $bkup_root directory already exists.
+# if so, rename it and create a new $bkup_root directory for this backup
+#
+if($full){
+  my $i = 1;
+  while(-d "${bkup_root}_$i"){
+    print "${bkup_root}_$i exists\n"; 
+    $i++;
+  }
+  rename $bkup_root, "${bkup_root}_$i";  
+  mkdir $bkup_root;
+  if(-l "$bkup_home/current") {
+    unlink("$bkup_home/current");
+  }
+  symlink "$bkup_root", "$bkup_home/current";
+}
+else{
+  # see if there is a current symbolic link
+  if(-l "$bkup_home/current"){
+    print "current directory exists. Checking for full backup\n";
+    $bkup_root="$bkup_home/current";
+    if(!-d "$bkup_home/current/full"){
+      print "You must run a full backup before you can run an incremental backup\n";
+      exit(5);
+    }
+  }
+  else{
+      print "You must run a full backup before you can run an incremental backup\n";
+      exit(6);
+  }
+}
+
+$cnf="$ENV{HOME}/.my.cnf";
+
+if(-f $cnf){
+  unlink $cnf;
+}
+
+print "creating $cnf\n";
+
+open(FD, ">$cnf");
+print FD "[client]\n";
+print FD "user=root\n";
+print FD "password=$root_pwd\n";
+close(FD);
+
+if($full){
+  &exec_cmd("innobackupex $parallel_opt $slave_opt $bkup_opt $bkup_root/full", "innobackupex: completed OK!");
+  if($apply_opt){
+    &exec_cmd("innobackupex $apply_opt /backup/percona/current/full ", "innobackupex: completed OK!");
+  }
+}
+else{
+  # doing an incremental. see if any have already been done. if so, find the latest. if not, we will create one with 
+  # the full backup as the base
+  my $i = 1;
+  while (-d "$bkup_root/inc$i"){
+    print "$bkup_root/inc$i exists ";
+    $last = $i;
+    $i++;
+    print "trying $bkup_root/inc$i\n";
+  }
+  if($i == 1){  # no incremental, yet
+    &exec_cmd("innobackupex $parallel_opt $slave_opt $bkup_opt --incremental $bkup_root/inc1 --incremental-basedir=$bkup_root/full", "innobackupex: completed OK!");
+
+    if($apply_opt){
+      &exec_cmd("innobackupex $slave_opt $apply_opt $bkup_root/full --incremental-dir=$bkup_root/inc1", "innobackupex: completed OK!");
+      }
+    }
+  else{
+    if($inc_opt == 1){
+      &exec_cmd("innobackupex $parallel_opt $slave_opt $bkup_opt --incremental $bkup_root/inc$i --incremental-basedir=$bkup_root/full", "innobackupex: completed OK!");
+      if($apply_opt){
+        &exec_cmd("innobackupex $slave_opt $apply_opt $bkup_root/full --incremental-dir=$bkup_root/inc$i", "innobackupex: completed OK!");
+      }
+    }
+    else{
+      &exec_cmd("innobackupex $parallel_opt $slave_opt $bkup_opt --incremental $bkup_root/inc$i --incremental-basedir=$bkup_root/inc$last", "innobackupex: completed OK!");
+      if($apply_opt){
+        &exec_cmd("innobackupex $slave_opt $apply_opt $bkup_root/full --incremental-dir=$bkup_root/inc$i", "innobackupex: completed OK!");
+      }
+    }
+  }
+}
+
+sub exec_cmd {
+my $cmd = shift;
+my $str = shift; # string that determines success
+
+print "$cmd\n";
+
+$success = 0;
+open(PS, "$cmd 2>&1 |");
+open(LOG, ">/backup/logs/xtrabackup_${now}.log");
+while(<PS>){
+  if($_ =~ /\Q$str/){
+     print "Backup completed successfully\n";
+     $success = 1;
+  }
+  print LOG $_;
+}
+close(PS);
+close(LOG);
+
+if(!$success){
+  print "Backup FAILED\n";
+  exit 10;
+}
+
+open(L, ">>${bkup_root}/record");
+print L "$cmd\n";
+close(L);
+}
